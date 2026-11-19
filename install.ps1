@@ -673,7 +673,7 @@ if ($runtimeDevice -eq "cuda") {
     "einops" "omegaconf>=2.3" "huggingface_hub" "transformers>=4.40" `
     "accelerate>=0.30" "diffusers>=0.27" "fastapi==0.115.5" `
     "uvicorn[standard]==0.32.1" "python-multipart==0.0.12" "pydantic>=2.0" `
-    "httpx" "scikit-image" "manifold3d" "rtree" "$rembgPkg" "$onnxPkg" "open3d" "PyMCubes" "pyrender" "kornia" "timm" -q
+    "httpx" "scikit-image" "manifold3d" "rtree" "psutil" "$rembgPkg" "$onnxPkg" "open3d" "PyMCubes" "pyrender" "kornia" "timm" -q
 if ($LASTEXITCODE -ne 0) { Fail "Core dependencies failed" }
 OK "Core dependencies installed"
 

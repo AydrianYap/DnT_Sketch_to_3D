@@ -7,10 +7,24 @@ school GPU machine; no student images are sent to outside AI services, and there
 no paid APIs or credits. See [`NOTICE.md`](NOTICE.md) for attribution and
 [`MODEL_LICENCES.md`](MODEL_LICENCES.md) for model licences.
 
-**Status:** Phase 0 (housekeeping) and Phase 1 (command-line prototype) are done.
-The print preparation and development mode are tested without a GPU.
-**Real AI generation has not yet been tested in this adaptation.** Follow
-[`docs/PHASE1_GPU_TEST.md`](docs/PHASE1_GPU_TEST.md) on the GPU machine.
+**Status:** see [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md). The web app, 3D viewer and
+print preparation are tested automatically in demo mode. **Real AI generation has not yet been
+tested** on the Lenovo or any other machine.
+
+### Start here (Windows laptop, no NVIDIA GPU)
+
+1. Install: [`docs/WINDOWS_CPU_SETUP.md`](docs/WINDOWS_CPU_SETUP.md)
+2. Double-click one of these in the app folder:
+
+   | File | What it does |
+   |---|---|
+   | `Start-Demo.bat` | Demo mode (sample models, no AI) on this laptop |
+   | `Start-AI.bat` | Real AI (TripoSR on the CPU) on this laptop |
+   | `Start-Demo-for-iPad.bat` | Demo mode, open on the iPad over Wi-Fi (shows an access code) |
+   | `Start-AI-for-iPad.bat` | Real AI on the laptop, used from the iPad |
+
+3. iPad over Wi-Fi: [`docs/IPAD_LOCAL_NETWORK.md`](docs/IPAD_LOCAL_NETWORK.md)
+4. Tests (automatic and manual checklists): [`docs/TESTING.md`](docs/TESTING.md)
 
 ### What is added on top of PIXFORM
 
@@ -38,14 +52,17 @@ Development mode skips the AI step and uses pre-made sample meshes
 part and a thin antenna). Everything after the AI step is the real code. To run the web
 server in development mode: `cd backend && DNT_DEV_MODE=1 python app.py`, then
 `POST /convert` with an image and optional `base=none|flatten|plinth`.
-(The new student interface is Phase 2; the original PIXFORM page is still served at `/`.)
+The student interface is at `/app/` (the address `/` redirects there); the original PIXFORM
+page is still available at `/pixform`.
 
 ### Settings
 
 All classroom limits live in `backend/dnt/config.py` and can be set by environment variables:
 `DNT_MAX_X_MM`, `DNT_MAX_Y_MM`, `DNT_MAX_Z_MM`, `DNT_MIN_THICKNESS_MM` (default 1.2),
 `DNT_BASE_HEIGHT_MM`, `DNT_ALLOWED_MODELS`, `DNT_DEV_MODE`, `DNT_MAX_UPLOAD_MB`,
-`DNT_TRIPOSR_UP_AXIS`.
+`DNT_TRIPOSR_UP_AXIS`, `DNT_HOST` (127.0.0.1 = this computer only; 0.0.0.0 = local network,
+requires an access code), `DNT_PORT`, `DNT_ACCESS_CODE`, `DNT_CPU_THREADS`, `DNT_CPU_MAX_RESOLUTION`
+(default 256), `DNT_ALLOWED_ORIGINS` (for a separately hosted front end; empty by default).
 
 ---
 

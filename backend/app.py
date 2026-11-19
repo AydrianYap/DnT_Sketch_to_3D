@@ -15,10 +15,10 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -39,6 +39,9 @@ if str(BASE_DIR) not in sys.path:
 
 from dnt.config import get_settings as get_dnt_settings
 from dnt.print_prep import prepare_for_print, remove_debris, BASE_MODES
+from dnt import access as dnt_access
+
+FRONTEND_APP_DIR = BASE_DIR.parent / "frontend" / "app"
 
 SAMPLE_MESH_DIR = BASE_DIR.parent / "sample-data" / "meshes"
 
@@ -68,6 +71,10 @@ model_health = {
 }
 jobs: dict = {}
 trellis2_infer_lock = asyncio.Lock()
+# D&T: only one AI job runs at a time (all devices). On a 16 GB CPU-only laptop two
+# TripoSR jobs at once would run out of memory; on a GPU they would run out of VRAM.
+ai_job_lock = asyncio.Lock()
+ai_queue: list = []
 
 VALID_POST_LEVELS = {"none", "light", "standard", "heavy"}
 TRIPOSR_RES_LEVELS = [1024, 896, 768, 640, 512, 448, 384, 320, 256, 192, 128]
@@ -438,6 +445,12 @@ def load_all_models():
             set_model_health("rembg", "failed", str(e2))
             logger.warning(f"rembg fallback failed: {e2}")
 
+    if runtime_device == "cpu":
+        threads = os.getenv("DNT_CPU_THREADS", "").strip()
+        if threads.isdigit() and int(threads) > 0:
+            torch.set_num_threads(int(threads))
+        logger.info(f"CPU mode: PyTorch will use {torch.get_num_threads()} threads")
+
     if runtime_device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -462,7 +475,9 @@ def load_all_models():
                 config_name="config.yaml",
                 weight_name="model.ckpt",
             )
-            m.renderer.set_chunk_size(131072 if runtime_device == "cuda" else 65536)
+            # D&T: smaller chunks on CPU keep peak memory down on a 16 GB laptop.
+            cpu_chunk = int(os.getenv("DNT_CPU_CHUNK", "32768"))
+            m.renderer.set_chunk_size(131072 if runtime_device == "cuda" else (65536 if runtime_device == "mps" else cpu_chunk))
             m.to(runtime_device)
             models["triposr"] = m
             set_model_health("triposr", "loaded")
@@ -640,7 +655,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PIXFORM", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# D&T: no cross-site access unless DNT_ALLOWED_ORIGINS lists the student web app's address
+# (for example the future Cloudflare page). The bundled page is same-origin and needs none.
+_allowed_origins = [o.strip() for o in os.getenv("DNT_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _allowed_origins:
+    app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_methods=["GET", "POST", "DELETE"],
+                       allow_headers=["Content-Type", dnt_access.HEADER_NAME], allow_credentials=True)
+
+
+@app.middleware("http")
+async def access_code_guard(request: Request, call_next):
+    """When an access code is set (always on a network-visible server), every API call
+    needs it. The page itself, its scripts and /health stay open so the code can be typed in."""
+    if dnt_access.is_required() and not dnt_access.is_public_path(request.url.path) \
+            and request.method != "OPTIONS" and not dnt_access.request_has_access(request):
+        return JSONResponse({"detail": "Access code needed", "code": "access_code_required"}, status_code=401)
+    return await call_next(request)
 
 
 # Data models
@@ -664,6 +694,12 @@ class JobStatus(BaseModel):
     base_mode: Optional[str] = None
     print_report: Optional[dict] = None
     report_url: Optional[str] = None
+    is_sample: Optional[bool] = None
+    queue_position: Optional[int] = None
+    adjustments: Optional[dict] = None
+    source_image_url: Optional[str] = None
+    stage_log: Optional[list] = None
+    revision: Optional[int] = None
 
 
 # Utilities
@@ -671,6 +707,10 @@ class JobStatus(BaseModel):
 def upd(job_id, **kw):
     if job_id in jobs:
         kw.setdefault("last_update_ts", time.time())
+        # D&T: remember when each stage started, for the timing report.
+        new_stage = kw.get("stage")
+        if new_stage and new_stage != jobs[job_id].get("stage"):
+            jobs[job_id].setdefault("stage_log", []).append([new_stage, round(time.time(), 3)])
         if "status" in kw and _job_terminal(str(kw["status"])):
             kw.setdefault("completed_at", time.time())
             kw.setdefault(
@@ -1245,8 +1285,20 @@ def _apply_print_prep(mesh, out_dir: Path, job_id: str, up_axis: Optional[str] =
     job = jobs.get(job_id, {})
     base_mode = job.get("base_mode") or "none"
     axis = up_axis or job.get("up_axis") or get_dnt_settings().triposr_up_axis
+    job["up_axis"] = axis
     upd(job_id, progress=93, message="Sizing for printing and checking the model...", stage="print_prep")
-    mesh, report = prepare_for_print(mesh, base_mode=base_mode, up_axis=axis)
+    # Keep the cleaned AI mesh so students can re-run sizing/rotation/base later
+    # without generating again (see /jobs/{job_id}/adjust).
+    try:
+        mesh.export(str(out_dir / "source.ply"))
+    except Exception as e:
+        logger.warning(f"Could not save source mesh for adjustments: {e}")
+    adj = job.get("adjustments") or {"rotate_deg": [0.0, 0.0, 0.0], "size_percent": 100.0, "base": base_mode}
+    mesh, report = prepare_for_print(mesh, base_mode=base_mode, up_axis=axis,
+                                     rotate_deg=adj.get("rotate_deg", (0, 0, 0)),
+                                     size_percent=adj.get("size_percent", 100.0))
+    adj["base"] = base_mode
+    upd(job_id, adjustments=adj)
     report_path = out_dir / "print_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     upd(job_id, print_report=report, report_url=f"/outputs/{job_id}/print_report.json")
@@ -2179,6 +2231,7 @@ async def run_demo(job_id: str, image_path: Path, out_dir: Path, settings: dict)
         elapsed = round(time.time() - t_start, 1)
         upd(job_id, status="done", progress=100,
             message=f"Development mode: sample model '{sample.stem}' (not an AI result)",
+            is_sample=True,
             model_used=f"Sample ({sample.stem})",
             time_taken=elapsed,
             preview_url=f"/outputs/{job_id}/preview.png",
@@ -2206,6 +2259,8 @@ async def health():
         cuda_ok = mps_ok = False
     return {
         "dev_mode":   dnt.dev_mode,
+        "access_code_required": dnt_access.is_required(),
+        "queue_length": len(ai_queue) + (1 if ai_job_lock.locked() else 0),
         "allowed_models": list(dnt.allowed_models),
         "max_box_mm": list(dnt.max_box_mm),
         "min_thickness_mm": dnt.min_thickness_mm,
@@ -2298,6 +2353,10 @@ async def convert(
         preserve_flag = preserve_raw == "true"
 
     normalized_resolution = _normalize_triposr_resolution(resolution)
+    if models.get("runtime_device") == "cpu" and not dnt.dev_mode:
+        # D&T: high marching-cubes resolutions take many minutes and lots of RAM on a CPU.
+        cpu_cap = int(os.getenv("DNT_CPU_MAX_RESOLUTION", "256"))
+        normalized_resolution = min(normalized_resolution, _normalize_triposr_resolution(cpu_cap))
     normalized_steps = max(5, min(1000, steps))
     if model == "trellis2":
         normalized_resolution = _normalize_trellis2_resolution(resolution)
@@ -2340,9 +2399,9 @@ async def convert(
             raise HTTPException(503, _model_unavailable_message("trellis2", "TRELLIS.2"))
         run_fn = run_trellis2
         model_label = "TRELLIS.2"
-    else:
-        run_fn = run_demo
-        model_label = "Demo"
+    else:  # unreachable: model was validated above. Never fall back to a sample silently.
+        _safe_unlink(img_path)
+        raise HTTPException(400, f"Unknown model: {model}")
 
     jobs[job_id] = dict(
         job_id=job_id, status="queued", progress=0,
@@ -2364,20 +2423,180 @@ async def convert(
         base_mode=base,
         print_report=None,
         report_url=None,
+        is_sample=bool(dnt.dev_mode),
+        queue_position=None,
+        adjustments={"rotate_deg": [0.0, 0.0, 0.0], "size_percent": 100.0, "base": base},
+        source_image_url=None,
     )
+    # Keep a small copy of the student's picture next to the result so the browser can
+    # show it beside the 3D model for comparison. (The full upload is deleted after use.)
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(img_path) as _im:
+            _im = _im.convert("RGB")
+            _im.thumbnail((1024, 1024))
+            (OUTPUT_DIR / job_id).mkdir(exist_ok=True)
+            _im.save(OUTPUT_DIR / job_id / "source_image.jpg", quality=88)
+        jobs[job_id]["source_image_url"] = f"/outputs/{job_id}/source_image.jpg"
+    except Exception as e:
+        _safe_unlink(img_path)
+        jobs.pop(job_id, None)
+        shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
+        raise HTTPException(400, f"That file could not be opened as a picture ({e.__class__.__name__}).")
 
     out_dir = OUTPUT_DIR / job_id
     out_dir.mkdir(exist_ok=True)
 
-    background_tasks.add_task(run_fn, job_id, img_path, out_dir, settings)
-    return JobStatus(**jobs[job_id])
+    background_tasks.add_task(_run_one_at_a_time, run_fn, job_id, img_path, out_dir, settings)
+    return JobStatus(**{k: v for k, v in jobs[job_id].items() if not k.startswith("_")})
+
+
+def _refresh_queue_positions():
+    for pos, jid in enumerate(ai_queue, start=1):
+        if jid in jobs and jobs[jid].get("status") == "queued":
+            jobs[jid]["queue_position"] = pos
+            jobs[jid]["message"] = ("Waiting for the AI engine..." if pos == 1 else
+                                    f"Waiting in line: {pos - 1} picture(s) ahead of yours")
+
+
+async def _run_one_at_a_time(run_fn, job_id, img_path, out_dir, settings):
+    """Run AI jobs strictly one after another, showing each waiting job its place in line."""
+    ai_queue.append(job_id)
+    _refresh_queue_positions()
+    try:
+        async with ai_job_lock:
+            if job_id in ai_queue:
+                ai_queue.remove(job_id)
+            _refresh_queue_positions()
+            if job_id in jobs:
+                jobs[job_id]["queue_position"] = 0
+            if _cancel_requested(job_id):
+                upd(job_id, status="cancelled", message="Cancelled before it started")
+                _finalize_job_resources(job_id)
+                return
+            await run_fn(job_id, img_path, out_dir, settings)
+    finally:
+        if job_id in ai_queue:
+            ai_queue.remove(job_id)
+            _refresh_queue_positions()
+
+
+class AdjustRequest(BaseModel):
+    rotate_x: float = 0.0
+    rotate_y: float = 0.0
+    rotate_z: float = 0.0
+    size_percent: float = 100.0
+    base: str = "none"
+
+
+def _adjust_sync(job_id: str, req: AdjustRequest) -> dict:
+    import trimesh
+    job = jobs[job_id]
+    out_dir = Path(job["output_dir"])
+    src = out_dir / "source.ply"
+    if not src.exists():
+        raise HTTPException(409, "This model cannot be adjusted (its source mesh is missing).")
+    mesh = trimesh.load(str(src), force="mesh")
+    mesh, report = prepare_for_print(
+        mesh, base_mode=req.base, up_axis=job.get("up_axis") or "z",
+        rotate_deg=(req.rotate_x, req.rotate_y, req.rotate_z), size_percent=req.size_percent)
+    stl, tmf, glb = out_dir / "model.stl", out_dir / "model.3mf", out_dir / "model.glb"
+    mesh.export(str(stl))
+    try:
+        mesh.export(str(tmf))
+    except Exception:
+        _export_3mf_manual(mesh, tmf)
+    for extra in (glb, out_dir / "model.obj"):
+        try:
+            mesh.export(str(extra))
+        except Exception as e:
+            logger.warning(f"{extra.suffix} export after adjust failed: {e}")
+    (out_dir / "print_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    adj = {"rotate_deg": [req.rotate_x, req.rotate_y, req.rotate_z],
+           "size_percent": req.size_percent, "base": req.base}
+    job["revision"] = int(job.get("revision") or 0) + 1
+    upd(job_id, print_report=report, adjustments=adj, base_mode=req.base, poly_count=len(mesh.faces))
+    return jobs[job_id]
+
+
+@app.post("/jobs/{job_id}/adjust", response_model=JobStatus)
+async def adjust_job(job_id: str, req: AdjustRequest):
+    """Re-run print preparation with the student's rotation, size and base choices.
+
+    The AI is not run again. The new STL/3MF replace the old ones, so the files a
+    student downloads are always the ones shown in the viewer.
+    """
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    if jobs[job_id].get("status") != "done":
+        raise HTTPException(409, "The model is not ready yet")
+    base = (req.base or "none").strip().lower()
+    if base not in BASE_MODES:
+        raise HTTPException(400, f"Invalid base. Use: {', '.join(BASE_MODES)}")
+    req.base = base
+    if not 10 <= req.size_percent <= 100:
+        raise HTTPException(400, "Size must be between 10% and 100%")
+    for a in (req.rotate_x, req.rotate_y, req.rotate_z):
+        if not -360 <= a <= 360:
+            raise HTTPException(400, "Rotation must be between -360 and 360 degrees")
+    lock = jobs[job_id].setdefault("_adjust_lock", asyncio.Lock())
+    async with lock:
+        try:
+            job = await asyncio.get_event_loop().run_in_executor(None, _adjust_sync, job_id, req)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Adjust failed for {job_id}: {e}", exc_info=True)
+            raise HTTPException(500, f"Could not apply that change: {e}")
+    return JobStatus(**{k: v for k, v in job.items() if not k.startswith("_")})
+
+
+DOWNLOAD_TYPES = {
+    "stl": ("model.stl", "model/stl"),
+    "3mf": ("model.3mf", "model/3mf"),
+    "report": ("print_report.json", "application/json"),
+}
+
+
+@app.get("/download/{job_id}/{kind}")
+async def download(job_id: str, kind: str, name: str = "figurine"):
+    """Download with a proper file name, so iPad Safari saves it to Files > Downloads."""
+    if job_id not in jobs or kind not in DOWNLOAD_TYPES:
+        raise HTTPException(404, "Not found")
+    fname, media = DOWNLOAD_TYPES[kind]
+    path = Path(jobs[job_id]["output_dir"]) / fname
+    if not path.exists():
+        raise HTTPException(404, "File not ready")
+    # Plain letters, digits, - and _ only (spaces become -) so every device and Bambu Studio
+    # keeps the name exactly.
+    safe = "".join(ch for ch in (name or "figurine") if ch.isalnum() or ch in "-_ ").strip()
+    safe = "-".join(safe.split())[:40] or "figurine"
+    suffix = "-print-report.json" if kind == "report" else f".{kind}"
+    return FileResponse(str(path), media_type=media, filename=f"{safe}{suffix}")
+
+
+class AccessRequest(BaseModel):
+    code: str
+
+
+@app.post("/auth")
+async def auth(req: AccessRequest):
+    """Check the access code shown on the laptop screen and remember this device."""
+    if not dnt_access.is_required():
+        return {"ok": True, "required": False}
+    if not dnt_access.code_matches(req.code):
+        raise HTTPException(401, "That access code is not right. Check the laptop screen.")
+    resp = JSONResponse({"ok": True, "required": True})
+    resp.set_cookie(dnt_access.COOKIE_NAME, dnt_access.session_token(), httponly=True, samesite="lax",
+                    max_age=12 * 3600)
+    return resp
 
 
 @app.get("/status/{job_id}", response_model=JobStatus)
 async def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
-    return JobStatus(**jobs[job_id])
+    return JobStatus(**{k: v for k, v in jobs[job_id].items() if not k.startswith("_")})
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -2423,8 +2642,32 @@ async def cleanup_jobs(all: bool = False):
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 
-@app.get("/", response_class=HTMLResponse)
+class _NoCacheStatic(StaticFiles):
+    """Static files that the browser re-checks each time, so updates show up on the iPad."""
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+if FRONTEND_APP_DIR.exists():
+    # The student interface lives at /app/ and uses relative links, so the same files
+    # can later be hosted elsewhere (e.g. Cloudflare) without changes.
+    app.mount("/app", _NoCacheStatic(directory=str(FRONTEND_APP_DIR), html=True), name="app")
+
+
+@app.get("/")
+async def serve_student_app():
+    """Send visitors to the D&T Sketch-to-3D student interface."""
+    from fastapi.responses import RedirectResponse
+    if (FRONTEND_APP_DIR / "index.html").exists():
+        return RedirectResponse("/app/")
+    return await serve_frontend()
+
+
+@app.get("/pixform", response_class=HTMLResponse)
 async def serve_frontend():
+    """The original PIXFORM interface (kept for reference and teachers)."""
     encodings = ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be")
     for candidate in [
         BASE_DIR.parent / "frontend" / "index.html",
@@ -2445,4 +2688,7 @@ async def serve_frontend():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    host = os.getenv("DNT_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.getenv("DNT_PORT", "8000"))
+    dnt_access.announce(host, port, logger)
+    uvicorn.run("app:app", host=host, port=port, reload=False)

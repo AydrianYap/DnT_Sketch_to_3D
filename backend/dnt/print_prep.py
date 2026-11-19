@@ -49,6 +49,20 @@ def orient_up(mesh: trimesh.Trimesh, up_axis: str = "z") -> trimesh.Trimesh:
     return mesh
 
 
+def rotate_mesh(mesh: trimesh.Trimesh, rotate_deg=(0.0, 0.0, 0.0)) -> trimesh.Trimesh:
+    """Rotate about X, then Y, then Z (degrees), around the mesh centre."""
+    rx, ry, rz = (float(a or 0.0) for a in rotate_deg)
+    if not (rx or ry or rz):
+        return mesh
+    mesh = mesh.copy()
+    centre = mesh.bounding_box.centroid
+    rot = trimesh.transformations.euler_matrix(np.radians(rx), np.radians(ry), np.radians(rz), axes="sxyz")
+    mesh.apply_translation(-centre)
+    mesh.apply_transform(rot)
+    mesh.apply_translation(centre)
+    return mesh
+
+
 def remove_debris(mesh: trimesh.Trimesh, fraction: float) -> Tuple[trimesh.Trimesh, int, int]:
     """Drop loose fragments smaller than `fraction` of the largest part (by surface area).
 
@@ -337,16 +351,26 @@ def run_checks(mesh: trimesh.Trimesh, settings: Optional[DntSettings] = None,
 # ---------------------------------------------------------------------------
 
 def prepare_for_print(mesh: trimesh.Trimesh, base_mode: str = "none", up_axis: str = "z",
-                      settings: Optional[DntSettings] = None) -> Tuple[trimesh.Trimesh, dict]:
-    """Orient, clean, scale, add base, then check. Returns (print-ready mesh, report)."""
+                      settings: Optional[DntSettings] = None, rotate_deg=(0.0, 0.0, 0.0),
+                      size_percent: float = 100.0) -> Tuple[trimesh.Trimesh, dict]:
+    """Orient, clean, scale, add base, then check. Returns (print-ready mesh, report).
+
+    rotate_deg: student rotation (X, Y, Z degrees) applied after the automatic up-axis turn.
+    size_percent: 100 = largest size that fits the print box; 50 = half that size.
+    """
     settings = settings or get_settings()
     base_mode = (base_mode or "none").strip().lower()
     if base_mode not in BASE_MODES:
         raise ValueError(f"base_mode must be one of {BASE_MODES}")
+    size_percent = float(size_percent)
+    if not (10.0 <= size_percent <= 100.0):
+        raise ValueError("size_percent must be between 10 and 100")
     notes = []
-    box = settings.max_box_mm
+    max_box = settings.max_box_mm
+    box = tuple(b * size_percent / 100.0 for b in max_box)
 
     mesh = orient_up(mesh, up_axis)
+    mesh = rotate_mesh(mesh, rotate_deg)
     mesh, removed, kept_parts = remove_debris(mesh, settings.debris_volume_fraction)
     if removed:
         notes.append(f"Removed {removed} tiny loose fragments.")
@@ -379,6 +403,8 @@ def prepare_for_print(mesh: trimesh.Trimesh, base_mode: str = "none", up_axis: s
 
     report = run_checks(mesh, settings, removed_debris=removed)
     report.update({
+        "rotate_deg": [float(a or 0.0) for a in rotate_deg],
+        "size_percent": size_percent,
         "scale_factor": round(scale, 6),
         "base_requested": base_mode,
         "base_applied": base_applied,

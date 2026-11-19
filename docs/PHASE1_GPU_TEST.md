@@ -1,3 +1,5 @@
+> **Lenovo / CPU users:** follow [WINDOWS_CPU_SETUP.md](WINDOWS_CPU_SETUP.md) instead. This page is for a machine with an NVIDIA GPU.
+
 # Phase 1 test on the GPU machine
 
 Goal: prove the real AI engine turns **one sketch into a printable STL** at the

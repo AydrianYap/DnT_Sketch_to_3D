@@ -40,3 +40,6 @@ desktop.ini
 student-data/
 test_*/
 output/
+test-results/
+my-test-images/
+tests/browser/output/

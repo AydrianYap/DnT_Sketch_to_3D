@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en-SG">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>D&amp;T Sketch-to-3D</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="32" height="32">
+      <div>
+        <h1>D&amp;T Sketch-to-3D</h1>
+        <p class="tagline">From sketch to 3D-printed figurine</p>
+      </div>
+    </div>
+    <div class="status-group">
+      <span id="modeBadge" class="badge badge-muted">Connecting…</span>
+      <span id="connDot" class="dot" title="Connection to the 3D engine" aria-label="Connection status"></span>
+    </div>
+  </header>
+
+  <div id="demoBanner" class="banner banner-demo" hidden>
+    <strong>Demo mode.</strong> The app shows a ready-made <em>sample</em> model (owl or robot) instead of
+    building one from your sketch. Use it to practise viewing, sizing and downloading.
+  </div>
+
+  <main id="main">
+    <!-- Step 1: sketch -->
+    <section id="stepSketch" class="card step" aria-labelledby="h-sketch">
+      <h2 id="h-sketch"><span class="step-num">1</span> Your sketch</h2>
+
+      <div id="pickArea" class="pick-area">
+        <p class="pick-lead">Take a photo of your drawing, or choose a picture.</p>
+        <div class="pick-buttons">
+          <label class="btn btn-primary btn-lg" for="cameraInput">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><circle cx="12" cy="13" r="3.5" /></svg>
+            Take a photo
+          </label>
+          <input id="cameraInput" type="file" accept="image/*" capture="environment" class="visually-hidden">
+          <label class="btn btn-secondary btn-lg" for="fileInput">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2" /><path d="m4 16 5-5 4 4 3-3 4 4" /></svg>
+            Choose a picture
+          </label>
+          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/*" class="visually-hidden">
+        </div>
+        <p class="pick-samples">No sketch yet? Try a sample:
+          <button class="link-btn" data-sample="owl">Owl</button> ·
+          <button class="link-btn" data-sample="robot">Robot</button>
+        </p>
+        <details class="tips">
+          <summary>Tips for a good result</summary>
+          <ul>
+            <li>Draw <strong>one</strong> figurine on plain white paper.</li>
+            <li>Colour and shade it. Shading helps the AI understand depth.</li>
+            <li>Draw it from the front, or turned slightly (a three-quarter view).</li>
+            <li>Photograph straight on, in good light, with no shadows across the page.</li>
+            <li>Crop close around your figurine.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div id="editArea" class="edit-area" hidden>
+        <div class="editor-stage" id="editorStage">
+          <canvas id="editorCanvas" aria-label="Your sketch. Drag the corners to crop."></canvas>
+        </div>
+        <p class="hint">Drag the white corners to crop. Drag inside the box to move it.</p>
+        <div class="tool-row">
+          <button class="btn btn-tool" id="rotLeft" aria-label="Rotate left">⟲ Rotate left</button>
+          <button class="btn btn-tool" id="rotRight" aria-label="Rotate right">⟳ Rotate right</button>
+          <button class="btn btn-tool" id="editReset">Undo edits</button>
+        </div>
+        <div class="slider-row">
+          <label for="brightness">Brightness</label>
+          <input id="brightness" type="range" min="0.5" max="1.6" step="0.05" value="1">
+          <label for="contrast">Contrast</label>
+          <input id="contrast" type="range" min="0.5" max="2" step="0.05" value="1">
+        </div>
+        <div class="tool-row">
+          <label class="btn btn-tool" for="fileInput">Replace picture</label>
+          <button class="btn btn-tool btn-danger-text" id="deleteSketch">Delete picture</button>
+        </div>
+
+        <div class="form-grid">
+          <label for="modelName">Name your figurine</label>
+          <input id="modelName" type="text" maxlength="40" placeholder="e.g. Ollie the Owl" autocomplete="off">
+          <span id="baseLabel">Base</span>
+          <div class="segmented" role="radiogroup" aria-labelledby="baseLabel" id="baseChoiceStart">
+            <button role="radio" data-base="none" aria-checked="true">No base</button>
+            <button role="radio" data-base="flatten" aria-checked="false">Flat bottom</button>
+            <button role="radio" data-base="plinth" aria-checked="false">Round plinth</button>
+          </div>
+        </div>
+        <button class="btn btn-primary btn-xl" id="generateBtn">Make my 3D model</button>
+      </div>
+    </section>
+
+    <!-- Step 2: progress -->
+    <section id="stepProgress" class="card step" hidden aria-live="polite">
+      <h2><span class="step-num">2</span> Making your 3D model</h2>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <p id="progressMsg" class="progress-msg">Starting…</p>
+      <p class="hint" id="progressHint">On a laptop without a graphics card this can take a few minutes. Keep this page open.</p>
+      <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
+    </section>
+
+    <!-- Error -->
+    <section id="errorCard" class="card card-error" hidden role="alert">
+      <h2>Something went wrong</h2>
+      <p id="errorMsg"></p>
+      <div class="tool-row">
+        <button class="btn btn-primary" id="errorRetry">Try again</button>
+        <button class="btn btn-secondary" id="errorBack">Back to my sketch</button>
+      </div>
+    </section>
+
+    <!-- Step 3: result -->
+    <section id="stepResult" class="step" hidden>
+      <div id="resultBanner" class="banner"></div>
+
+      <div class="result-grid">
+        <div class="card viewer-card">
+          <h2><span class="step-num">3</span> Your 3D model</h2>
+          <div class="viewer-stage" id="viewerStage">
+            <div class="viewer-dims" id="viewerDims" aria-live="polite"></div>
+            <div class="viewer-busy" id="viewerBusy" hidden>Updating print file…</div>
+          </div>
+          <div class="view-buttons" role="group" aria-label="Camera views">
+            <button class="chip" data-view="front">Front</button>
+            <button class="chip" data-view="back">Back</button>
+            <button class="chip" data-view="left">Left</button>
+            <button class="chip" data-view="right">Right</button>
+            <button class="chip" data-view="top">Top</button>
+            <button class="chip" data-view="bottom">Bottom</button>
+            <button class="chip" data-action="fit">Fit</button>
+            <button class="chip" data-action="reset">Reset</button>
+            <button class="chip" data-action="wireframe" aria-pressed="false">Wireframe</button>
+          </div>
+          <p class="hint">One finger: rotate · Pinch: zoom · Two fingers: move. The dashed box is the 40 × 40 × 60 mm print limit.</p>
+        </div>
+
+        <div class="card compare-card">
+          <h2>Compare with your sketch</h2>
+          <img id="compareImg" alt="Your sketch">
+          <button class="btn btn-secondary" id="matchFront">Show model from the front</button>
+          <p class="hint">Does the 3D model keep your design's outline, proportions and special features?</p>
+        </div>
+      </div>
+
+      <div class="result-grid">
+        <div class="card">
+          <h2>Adjust</h2>
+          <div class="adjust-group">
+            <span class="adjust-label">Turn</span>
+            <div class="tool-row">
+              <button class="btn btn-tool" data-rot="z,-15">↺ 15°</button>
+              <button class="btn btn-tool" data-rot="z,15">↻ 15°</button>
+              <button class="btn btn-tool" data-rot="z,90">↻ 90°</button>
+            </div>
+            <span class="adjust-label">Tip over (choose which side faces down)</span>
+            <div class="tool-row">
+              <button class="btn btn-tool" data-rot="x,90">Forward 90°</button>
+              <button class="btn btn-tool" data-rot="x,-90">Back 90°</button>
+              <button class="btn btn-tool" data-rot="y,90">Sideways 90°</button>
+            </div>
+          </div>
+          <div class="adjust-group">
+            <label class="adjust-label" for="sizeSlider">Size: <strong id="sizeValue">100%</strong> of the largest that fits</label>
+            <input id="sizeSlider" type="range" min="30" max="100" step="5" value="100">
+          </div>
+          <div class="adjust-group">
+            <span class="adjust-label" id="baseLabel2">Base</span>
+            <div class="segmented" role="radiogroup" aria-labelledby="baseLabel2" id="baseChoiceAdjust">
+              <button role="radio" data-base="none" aria-checked="true">No base</button>
+              <button role="radio" data-base="flatten" aria-checked="false">Flat bottom</button>
+              <button role="radio" data-base="plinth" aria-checked="false">Round plinth</button>
+            </div>
+          </div>
+          <div class="tool-row">
+            <button class="btn btn-tool" id="undoBtn" disabled>Undo</button>
+            <button class="btn btn-tool" id="redoBtn" disabled>Redo</button>
+            <button class="btn btn-tool" id="adjustReset">Reset all</button>
+          </div>
+          <p class="hint" id="adjustStatus">The model always sits in the middle of the print plate.</p>
+        </div>
+
+        <div class="card">
+          <h2>Ready to print?</h2>
+          <div id="reportOverall" class="report-overall"></div>
+          <ul id="reportList" class="report-list"></ul>
+          <p class="hint" id="reportMeta"></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="step-num">4</span> Download</h2>
+        <div class="tool-row">
+          <a class="btn btn-primary btn-lg" id="dlStl" href="#" download>Download STL</a>
+          <a class="btn btn-primary btn-lg" id="dl3mf" href="#" download>Download 3MF</a>
+          <a class="btn btn-secondary" id="dlReport" href="#" download>Print report</a>
+        </div>
+        <p class="hint" id="downloadNote"></p>
+        <details class="tips">
+          <summary>How to save on iPad and open in Bambu Studio</summary>
+          <ol>
+            <li>Tap <strong>Download 3MF</strong> (or STL). Safari asks to download: tap <strong>Download</strong>.</li>
+            <li>The file is saved in the <strong>Files</strong> app, in <strong>Downloads</strong>.</li>
+            <li>Send it to the computer that runs Bambu Studio (AirDrop, school drive, or as your teacher says).</li>
+            <li>In Bambu Studio: <strong>File → Import → Import 3MF/STL</strong>. The size is already in millimetres, so do not scale it.</li>
+          </ol>
+        </details>
+      </div>
+
+      <div class="tool-row center">
+        <button class="btn btn-secondary btn-lg" id="startAgain">Start again with a new sketch</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="codeDialog" aria-labelledby="codeTitle">
+    <form method="dialog" id="codeForm">
+      <h2 id="codeTitle">Enter the access code</h2>
+      <p>The code is shown on the laptop that runs the 3D engine.</p>
+      <input id="codeInput" inputmode="text" autocapitalize="characters" autocomplete="off" maxlength="12" required aria-label="Access code">
+      <p id="codeError" class="error-text" hidden></p>
+      <button class="btn btn-primary btn-lg" id="codeSubmit" value="ok">Connect</button>
+    </form>
+  </dialog>
+
+  <footer class="footer">
+    D&amp;T Sketch-to-3D · based on <a href="https://github.com/dmonfrooij/pixform" target="_blank" rel="noopener">PIXFORM</a> (GPL-3.0) ·
+    3D engine runs on a local computer; pictures are not sent to outside AI services.
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
