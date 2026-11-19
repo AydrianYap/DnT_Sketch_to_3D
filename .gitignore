@@ -35,3 +35,8 @@ nvdiffrast_build.log
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# D&T Sketch-to-3D: never commit student work or local test output
+student-data/
+test_*/
+output/

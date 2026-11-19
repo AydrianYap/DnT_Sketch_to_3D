@@ -1,0 +1,20 @@
+# Extra packages for the D&T Sketch-to-3D print preparation (backend/dnt).
+# The installers add these automatically; this file is for manual installs,
+# and for development mode, which needs no PyTorch or AI model:
+#
+#   pip install -r backend/requirements-dnt.txt
+#
+numpy
+pillow
+scipy
+scikit-image
+trimesh
+manifold3d
+rtree
+lxml
+networkx
+fastapi
+uvicorn
+python-multipart
+httpx
+pytest

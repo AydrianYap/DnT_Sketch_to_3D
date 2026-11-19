@@ -1,14 +1,18 @@
 """
 PIXFORM Backend
 Image to 3D pipeline - TripoSR (fast) + Hunyuan3D-2 (quality) + TRELLIS (best)
+
+D&T Sketch-to-3D adaptation: based on PIXFORM (GPL-3.0, see NOTICE.md). Changes
+in this file: the remote TRELLIS.2 endpoint mode was removed so images never
+leave this machine; models are limited to an approved list; a development mode
+serves sample meshes without a GPU; every export goes through the classroom
+print preparation in backend/dnt (fit to 40 x 40 x 60 mm, optional base, checks).
 """
-import os, sys, uuid, shutil, asyncio, logging, zipfile, time, json, gc, base64
+import os, sys, uuid, shutil, asyncio, logging, zipfile, time, json, gc
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
-from urllib import request as urlrequest, error as urlerror
-from urllib.parse import urlparse
 
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -32,6 +36,11 @@ MODEL_KEYS = ("triposr", "hunyuan", "trellis", "trellis2")
 
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+from dnt.config import get_settings as get_dnt_settings
+from dnt.print_prep import prepare_for_print, remove_debris, BASE_MODES
+
+SAMPLE_MESH_DIR = BASE_DIR.parent / "sample-data" / "meshes"
 
 # hy3dgen is path-based, not a package - add it explicitly
 _hy3d_path = BASE_DIR / "hy3dgen"
@@ -225,28 +234,6 @@ def _load_trellis2_pipeline_with_auth_compat(Trellis2ImageTo3DPipeline, source: 
     return Trellis2ImageTo3DPipeline.from_pretrained(source)
 
 
-def _resolve_trellis2_endpoint_url() -> str:
-    return os.getenv("PIXFORM_TRELLIS2_ENDPOINT_URL", "").strip()
-
-
-def _resolve_trellis2_endpoint_timeout_sec() -> int:
-    try:
-        v = int(str(os.getenv("PIXFORM_TRELLIS2_ENDPOINT_TIMEOUT_SEC", "90")).strip())
-    except Exception:
-        v = 90
-    return max(10, v)
-
-
-def _redacted_endpoint_for_log(endpoint_url: str) -> str:
-    try:
-        p = urlparse(endpoint_url)
-        host = p.netloc or endpoint_url
-        path = p.path or ""
-        return f"{host}{path}"
-    except Exception:
-        return endpoint_url
-
-
 def _resolve_installed_models() -> dict:
     detected = {
         "triposr": (BASE_DIR / "tsr").exists(),
@@ -420,6 +407,11 @@ def load_all_models():
     models["runtime_device"] = runtime_device
     installed_models = _resolve_installed_models()
     active_models = _resolve_active_models(installed_models)
+    allowed = set(get_dnt_settings().allowed_models)
+    blocked = [n for n in MODEL_KEYS if active_models.get(n) and n not in allowed]
+    if blocked:
+        logger.info("Not loading %s: not on the approved model list (DNT_ALLOWED_MODELS)", ", ".join(blocked))
+    active_models = {n: bool(active_models.get(n)) and n in allowed for n in MODEL_KEYS}
     models["installed_models"] = installed_models
     models["active_models"] = active_models
     logger.info(f"Runtime device: {runtime_device}")
@@ -628,7 +620,12 @@ def load_all_models():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, load_all_models)
+    if get_dnt_settings().dev_mode:
+        logger.info("DEVELOPMENT MODE: no AI model is loaded; uploads get sample meshes from %s", SAMPLE_MESH_DIR)
+        for name in model_health:
+            set_model_health(name, "inactive", "Development mode")
+    else:
+        await loop.run_in_executor(None, load_all_models)
     cleanup_stop = asyncio.Event()
     cleanup_task = asyncio.create_task(_job_cleanup_loop(cleanup_stop))
     try:
@@ -664,9 +661,9 @@ class JobStatus(BaseModel):
     cancel_requested: Optional[bool] = None
     stage: Optional[str] = None
     last_update_ts: Optional[float] = None
-    endpoint_attempted: Optional[bool] = None
-    endpoint_used: Optional[bool] = None
-    endpoint_fail_reason: Optional[str] = None
+    base_mode: Optional[str] = None
+    print_report: Optional[dict] = None
+    report_url: Optional[str] = None
 
 
 # Utilities
@@ -1027,11 +1024,13 @@ def postprocess_mesh(mesh, job_id, level="standard", target_profile: Optional[di
     upd(job_id, progress=86, message="Cleaning mesh...")
 
     # ÔöÇÔöÇ 1. Keep largest component ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+    # D&T change: PIXFORM kept only the largest part, which silently deleted real
+    # pieces (e.g. a detached arm). Now only tiny AI noise is removed; real parts are
+    # kept and reported to the student by the print checks.
     try:
-        parts = mesh.split(only_watertight=False)
-        if len(parts) > 1:
-            mesh = max(parts, key=lambda g: len(g.faces))
-            logger.info(f"Keeping largest connected component: {len(mesh.faces):,} faces")
+        mesh, _removed, _kept = remove_debris(mesh, get_dnt_settings().debris_volume_fraction)
+        if _removed:
+            logger.info(f"Removed {_removed} tiny fragments; kept {_kept} part(s)")
     except Exception:
         pass
 
@@ -1238,8 +1237,26 @@ def to_trimesh(raw):
     return trimesh.Trimesh(vertices=raw.vertices, faces=raw.faces)
 
 
+def _apply_print_prep(mesh, out_dir: Path, job_id: str, up_axis: Optional[str] = None):
+    """Classroom print preparation: fit to the print box, optional base, checks.
+
+    Writes print_report.json next to the model and stores the report on the job.
+    """
+    job = jobs.get(job_id, {})
+    base_mode = job.get("base_mode") or "none"
+    axis = up_axis or job.get("up_axis") or get_dnt_settings().triposr_up_axis
+    upd(job_id, progress=93, message="Sizing for printing and checking the model...", stage="print_prep")
+    mesh, report = prepare_for_print(mesh, base_mode=base_mode, up_axis=axis)
+    report_path = out_dir / "print_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    upd(job_id, print_report=report, report_url=f"/outputs/{job_id}/print_report.json")
+    logger.info("Print prep: %s, size %s mm, base=%s", report["overall"], report["size_mm"], report["base_applied"])
+    return mesh
+
+
 def export_all(mesh, out_dir: Path, job_id: str):
-    """Export mesh to STL, 3MF, GLB and OBJ."""
+    """Prepare the mesh for printing, then export STL, 3MF, GLB and OBJ. Returns the prepared mesh."""
+    mesh = _apply_print_prep(mesh, out_dir, job_id)
     stl = out_dir / "model.stl"
     tmf = out_dir / "model.3mf"
     glb = out_dir / "model.glb"
@@ -1269,6 +1286,7 @@ def export_all(mesh, out_dir: Path, job_id: str):
         obj_url=f"/outputs/{job_id}/model.obj" if obj.exists() else None,
         poly_count=len(mesh.faces),
     )
+    return mesh
 
 
 def _export_3mf_manual(mesh, path: Path):
@@ -1470,7 +1488,8 @@ async def run_triposr(job_id: str, image_path: Path, out_dir: Path, settings: di
         _assert_not_cancelled(job_id)
 
         upd(job_id, progress=95, message="Exporting files...", stage="export")
-        export_all(mesh, out_dir, job_id)
+        _m = mesh
+        mesh = await asyncio.get_event_loop().run_in_executor(None, lambda: export_all(_m, out_dir, job_id))
         render_preview(mesh, out_dir / "preview.png")
         _assert_not_cancelled(job_id)
 
@@ -1589,7 +1608,8 @@ async def run_hunyuan(job_id: str, image_path: Path, out_dir: Path, settings: di
 
         # Export
         upd(job_id, progress=95, message="Exporting files...", stage="export")
-        export_all(mesh, out_dir, job_id)
+        _m = mesh
+        mesh = await asyncio.get_event_loop().run_in_executor(None, lambda: export_all(_m, out_dir, job_id))
         render_preview(mesh, out_dir / "preview.png")
         _assert_not_cancelled(job_id)
 
@@ -1767,6 +1787,8 @@ async def run_trellis(job_id: str, image_path: Path, out_dir: Path, settings: di
 
         upd(job_id, progress=95, message="Exporting files...", stage="export")
 
+        _m = mesh
+        mesh = await asyncio.get_event_loop().run_in_executor(None, lambda: _apply_print_prep(_m, out_dir, job_id))
         stl      = out_dir / "model.stl"
         tmf      = out_dir / "model.3mf"
         glb_path = out_dir / "model.glb"
@@ -2048,6 +2070,8 @@ async def run_trellis2(job_id: str, image_path: Path, out_dir: Path, settings: d
         # ── Export ─────────────────────────────────────────────────────────────
         upd(job_id, progress=95, message="Exporting files...", stage="export")
 
+        _m = mesh
+        mesh = await asyncio.get_event_loop().run_in_executor(None, lambda: _apply_print_prep(_m, out_dir, job_id))
         stl      = out_dir / "model.stl"
         tmf      = out_dir / "model.3mf"
         glb_path = out_dir / "model.glb"
@@ -2107,299 +2131,85 @@ async def run_trellis2(job_id: str, image_path: Path, out_dir: Path, settings: d
         _finalize_job_resources(job_id)
 
 
-def _decode_data_url_or_b64(value: str) -> bytes:
-    payload = value.strip()
-    if payload.startswith("data:") and "," in payload:
-        payload = payload.split(",", 1)[1]
-    return base64.b64decode(payload)
+# Demo / development pipeline (no GPU)
 
+def _pick_sample_mesh(source_name: str) -> Path:
+    """Choose a pre-made sample mesh for development mode.
 
-def _write_optional_b64_file(payload: Optional[str], out_path: Path) -> bool:
-    if not payload or not isinstance(payload, str):
-        return False
-    try:
-        out_path.write_bytes(_decode_data_url_or_b64(payload))
-        return True
-    except Exception:
-        return False
-
-
-def _write_optional_url_file(file_url: Optional[str], out_path: Path, auth_token: Optional[str]) -> bool:
-    if not file_url or not isinstance(file_url, str):
-        return False
-    try:
-        headers = {"Accept": "application/octet-stream"}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        req = urlrequest.Request(file_url, headers=headers, method="GET")
-        with urlrequest.urlopen(req, timeout=45) as resp:
-            out_path.write_bytes(resp.read())
-        return True
-    except Exception:
-        return False
-
-
-def _extract_endpoint_outputs_to_dir(endpoint_payload: dict, out_dir: Path, auth_token: Optional[str]) -> dict:
-    blob = endpoint_payload if isinstance(endpoint_payload, dict) else {}
-    nested = blob.get("outputs") if isinstance(blob.get("outputs"), dict) else {}
-
-    def _pick(*keys):
-        for k in keys:
-            if k in blob:
-                return blob.get(k)
-            if k in nested:
-                return nested.get(k)
-        return None
-
-    _write_optional_b64_file(_pick("glb_base64", "model_glb_base64"), out_dir / "model.glb")
-    _write_optional_b64_file(_pick("obj_base64", "model_obj_base64"), out_dir / "model.obj")
-    _write_optional_b64_file(_pick("stl_base64", "model_stl_base64"), out_dir / "model.stl")
-    _write_optional_b64_file(_pick("tmf_base64", "3mf_base64", "model_3mf_base64"), out_dir / "model.3mf")
-    _write_optional_b64_file(_pick("preview_base64", "preview_png_base64"), out_dir / "preview.png")
-
-    _write_optional_url_file(_pick("glb_url", "model_glb_url"), out_dir / "model.glb", auth_token)
-    _write_optional_url_file(_pick("obj_url", "model_obj_url"), out_dir / "model.obj", auth_token)
-    _write_optional_url_file(_pick("stl_url", "model_stl_url"), out_dir / "model.stl", auth_token)
-    _write_optional_url_file(_pick("tmf_url", "3mf_url", "model_3mf_url"), out_dir / "model.3mf", auth_token)
-    _write_optional_url_file(_pick("preview_url", "preview_png_url"), out_dir / "preview.png", auth_token)
-
-    return {
-        "glb_url": "model.glb" if (out_dir / "model.glb").exists() else None,
-        "obj_url": "model.obj" if (out_dir / "model.obj").exists() else None,
-        "stl_url": "model.stl" if (out_dir / "model.stl").exists() else None,
-        "tmf_url": "model.3mf" if (out_dir / "model.3mf").exists() else None,
-        "preview_url": "preview.png" if (out_dir / "preview.png").exists() else None,
-        "poly_count": _pick("poly_count"),
-    }
-
-
-def _post_trellis2_endpoint_sync(image_path: Path, settings: dict, out_dir: Path) -> dict:
-    endpoint_url = _resolve_trellis2_endpoint_url()
-    if not endpoint_url:
-        return {"ok": False, "reason": "endpoint disabled"}
-
-    hf_token = _resolve_hf_token()
-    if not hf_token:
-        return {"ok": False, "reason": "HF token missing"}
-
-    request_body = {
-        "inputs": {
-            "image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
-        },
-        "parameters": {
-            "remove_bg": bool(settings.get("remove_bg", True)),
-            "resolution": int(settings.get("resolution", 1024)),
-            "steps": int(settings.get("steps", 36)),
-            "post": str(settings.get("post", "standard")),
-            "preserve_proportions": bool(settings.get("preserve_proportions", True)),
-        },
-        "options": {
-            "wait_for_model": True,
-        },
-    }
-
-    timeout_sec = _resolve_trellis2_endpoint_timeout_sec()
-    endpoint_log_name = _redacted_endpoint_for_log(endpoint_url)
-    img_size = 0
-    try:
-        img_size = image_path.stat().st_size
-    except Exception:
-        pass
-    logger.info(
-        "TRELLIS.2 endpoint request: endpoint=%s timeout=%ss image_bytes=%s steps=%s res=%s post=%s",
-        endpoint_log_name,
-        timeout_sec,
-        img_size,
-        settings.get("steps"),
-        settings.get("resolution"),
-        settings.get("post"),
-    )
-
-    started = time.monotonic()
-    poll_round = 0
-    while True:
-        poll_round += 1
-        logger.info("TRELLIS.2 endpoint poll #%s -> %s", poll_round, endpoint_log_name)
-        req = urlrequest.Request(
-            endpoint_url,
-            data=json.dumps(request_body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {hf_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, application/octet-stream, model/gltf-binary",
-            },
-            method="POST",
+    An upload whose file name contains a sample's name (e.g. "robot.png") gets that
+    sample; anything else gets DNT_DEV_SAMPLE (default "owl").
+    """
+    samples = sorted(SAMPLE_MESH_DIR.glob("*.stl"))
+    if not samples:
+        raise RuntimeError(
+            f"No sample meshes in {SAMPLE_MESH_DIR}. Run: python scripts/make_samples.py"
         )
-        try:
-            with urlrequest.urlopen(req, timeout=min(60, timeout_sec)) as resp:
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                raw = resp.read()
-                logger.info(
-                    "TRELLIS.2 endpoint response: status=%s content_type=%s bytes=%s",
-                    getattr(resp, "status", "?"),
-                    ctype or "unknown",
-                    len(raw),
-                )
-        except urlerror.HTTPError as e:
-            try:
-                err_raw = e.read().decode("utf-8", errors="ignore")
-                err_json = json.loads(err_raw) if err_raw else {}
-            except Exception:
-                err_json = {}
-                err_raw = str(e)
-
-            if e.code in {503, 504}:
-                est = err_json.get("estimated_time") if isinstance(err_json, dict) else None
-                sleep_s = int(est) if isinstance(est, (int, float)) else 5
-                logger.warning(
-                    "TRELLIS.2 endpoint transient HTTP %s on poll #%s (estimated_time=%s)",
-                    e.code,
-                    poll_round,
-                    est,
-                )
-                if time.monotonic() - started + sleep_s >= timeout_sec:
-                    return {"ok": False, "reason": f"endpoint timeout after {timeout_sec}s"}
-                time.sleep(max(2, min(sleep_s, 20)))
-                continue
-
-            return {"ok": False, "reason": f"http {e.code}: {err_raw}"}
-        except Exception as e:
-            return {"ok": False, "reason": f"endpoint request failed: {e}"}
-
-        if "application/octet-stream" in ctype or "model/gltf-binary" in ctype:
-            (out_dir / "model.glb").write_bytes(raw)
-            logger.info("TRELLIS.2 endpoint returned binary GLB payload")
-            return {
-                "ok": True,
-                "glb_url": "model.glb",
-                "obj_url": None,
-                "stl_url": None,
-                "tmf_url": None,
-                "preview_url": None,
-                "poly_count": None,
-            }
-
-        try:
-            payload = json.loads(raw.decode("utf-8", errors="ignore"))
-        except Exception:
-            return {"ok": False, "reason": "endpoint returned unsupported response"}
-
-        if isinstance(payload, dict) and payload.get("error"):
-            err_text = str(payload.get("error"))
-            est = payload.get("estimated_time")
-            logger.warning(
-                "TRELLIS.2 endpoint JSON error on poll #%s: %s (estimated_time=%s)",
-                poll_round,
-                err_text,
-                est,
-            )
-            if est is not None and time.monotonic() - started < timeout_sec:
-                sleep_s = max(2, min(int(est), 20)) if isinstance(est, (int, float)) else 5
-                if time.monotonic() - started + sleep_s >= timeout_sec:
-                    return {"ok": False, "reason": f"endpoint timeout after {timeout_sec}s"}
-                time.sleep(sleep_s)
-                continue
-            return {"ok": False, "reason": err_text}
-
-        files = _extract_endpoint_outputs_to_dir(payload if isinstance(payload, dict) else {}, out_dir, hf_token)
-        has_mesh = any(files.get(k) for k in ("glb_url", "obj_url", "stl_url", "tmf_url"))
-        logger.info(
-            "TRELLIS.2 endpoint artifacts: glb=%s obj=%s stl=%s 3mf=%s preview=%s",
-            bool(files.get("glb_url")),
-            bool(files.get("obj_url")),
-            bool(files.get("stl_url")),
-            bool(files.get("tmf_url")),
-            bool(files.get("preview_url")),
-        )
-        if has_mesh:
-            return {"ok": True, **files}
-
-        if time.monotonic() - started >= timeout_sec:
-            return {"ok": False, "reason": f"endpoint timeout after {timeout_sec}s"}
-        if poll_round >= 2:
-            return {"ok": False, "reason": "endpoint returned no mesh artifacts"}
-        time.sleep(3)
+    stem = Path(source_name or "").stem.lower()
+    for cand in samples:
+        if cand.stem.lower() in stem:
+            return cand
+    default = os.getenv("DNT_DEV_SAMPLE", "owl").strip().lower()
+    for cand in samples:
+        if cand.stem.lower() == default:
+            return cand
+    return samples[0]
 
 
-async def run_trellis2_endpoint_first(job_id: str, image_path: Path, out_dir: Path, settings: dict):
+async def run_demo(job_id: str, image_path: Path, out_dir: Path, settings: dict):
+    """Development mode: skip the AI step and use a pre-made sample mesh.
+
+    Everything after the AI step (print preparation, checks, export, preview) is the
+    real code. The result is clearly labelled as a sample, not an AI result.
+    """
     try:
-        endpoint_url = _resolve_trellis2_endpoint_url()
-        upd(job_id, endpoint_attempted=False, endpoint_used=False, endpoint_fail_reason=None)
-        if endpoint_url:
-            upd(job_id, endpoint_attempted=True)
-            upd(job_id, status="processing", progress=6, message="Trying TRELLIS.2 endpoint...", stage="endpoint")
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, lambda: _post_trellis2_endpoint_sync(image_path, settings, out_dir))
+        import trimesh
+        t_start = time.time()
+        sample = _pick_sample_mesh(settings.get("source_name", ""))
+        for p, m, stage in [(15, "Reading your picture (development mode)...", "load_image"),
+                            (45, f"Using sample model '{sample.stem}' instead of AI...", "inference")]:
+            upd(job_id, status="processing", progress=p, message=m, stage=stage)
+            await asyncio.sleep(0.4)
             _assert_not_cancelled(job_id)
-            if result.get("ok"):
-                elapsed = round(time.time() - float(jobs.get(job_id, {}).get("created_at", time.time())), 1)
-                upd(
-                    job_id,
-                    status="done",
-                    progress=100,
-                    message=f"Done in {elapsed}s (endpoint)",
-                    model_used="TRELLIS.2 (endpoint)",
-                    endpoint_used=True,
-                    time_taken=elapsed,
-                    stl_url=f"/outputs/{job_id}/{result['stl_url']}" if result.get("stl_url") else None,
-                    tmf_url=f"/outputs/{job_id}/{result['tmf_url']}" if result.get("tmf_url") else None,
-                    glb_url=f"/outputs/{job_id}/{result['glb_url']}" if result.get("glb_url") else None,
-                    obj_url=f"/outputs/{job_id}/{result['obj_url']}" if result.get("obj_url") else None,
-                    preview_url=f"/outputs/{job_id}/{result['preview_url']}" if result.get("preview_url") else None,
-                    poly_count=result.get("poly_count") if isinstance(result.get("poly_count"), int) else None,
-                    stage="done",
-                )
-                return
-            fail_reason = str(result.get("reason", "unknown endpoint failure"))
-            logger.warning("TRELLIS.2 endpoint failed, falling back to local: %s", fail_reason)
-            upd(
-                job_id,
-                endpoint_fail_reason=fail_reason,
-                progress=8,
-                message=f"Endpoint failed ({fail_reason}), falling back to local...",
-                stage="endpoint_fallback",
-            )
-
-        if models.get("trellis2") is None:
-            upd(job_id, status="error", message="TRELLIS.2 local model unavailable and endpoint failed")
-            return
-
-        logger.info("TRELLIS.2 local fallback started for job %s", job_id)
-        await run_trellis2(job_id, image_path, out_dir, settings)
+        mesh = trimesh.load(str(sample), force="mesh")
+        loop = asyncio.get_event_loop()
+        # Sample meshes are authored Z-up.
+        jobs.get(job_id, {})["up_axis"] = "z"
+        mesh = await loop.run_in_executor(None, lambda: export_all(mesh, out_dir, job_id))
+        render_preview(mesh, out_dir / "preview.png")
+        elapsed = round(time.time() - t_start, 1)
+        upd(job_id, status="done", progress=100,
+            message=f"Development mode: sample model '{sample.stem}' (not an AI result)",
+            model_used=f"Sample ({sample.stem})",
+            time_taken=elapsed,
+            preview_url=f"/outputs/{job_id}/preview.png",
+            stage="done")
     except Exception as e:
         if str(e) == "Job cancelled by user":
             upd(job_id, status="cancelled", message="Cancelled by user")
             return
-        logger.error(f"TRELLIS.2 endpoint/local orchestration failed: {e}", exc_info=True)
+        logger.error(f"Development-mode job failed: {e}", exc_info=True)
         upd(job_id, status="error", message=str(e))
+    finally:
         _finalize_job_resources(job_id)
-
-
-# ÔöÇÔöÇ Demo pipeline (no GPU) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-
-async def run_demo(job_id: str, image_path: Path, out_dir: Path, settings: dict):
-    import trimesh
-    for p, m in [(20, "Analyzing..."), (50, "Building mesh..."), (80, "Exporting...")]:
-        stage = "analyze" if p == 20 else ("build" if p == 50 else "export")
-        upd(job_id, status="processing", progress=p, message=m, stage=stage)
-        await asyncio.sleep(0.8)
-    mesh = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
-    export_all(mesh, out_dir, job_id)
-    render_preview(mesh, out_dir / "preview.png")
-    upd(job_id, status="done", progress=100,
-        message="Demo mode - no GPU available",
-        model_used="Demo",
-        preview_url=f"/outputs/{job_id}/preview.png",
-        stage="done")
 
 
 # ÔöÇÔöÇ Routes ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 @app.get("/health")
 async def health():
-    import torch
-    mps_backend = getattr(torch.backends, "mps", None)
-    mps_ok = bool(mps_backend) and mps_backend.is_available()
+    dnt = get_dnt_settings()
+    try:
+        import torch
+        mps_backend = getattr(torch.backends, "mps", None)
+        mps_ok = bool(mps_backend) and mps_backend.is_available()
+        cuda_ok = torch.cuda.is_available()
+    except ImportError:  # development mode can run without PyTorch installed
+        cuda_ok = mps_ok = False
     return {
+        "dev_mode":   dnt.dev_mode,
+        "allowed_models": list(dnt.allowed_models),
+        "max_box_mm": list(dnt.max_box_mm),
+        "min_thickness_mm": dnt.min_thickness_mm,
+        "base_modes": list(BASE_MODES),
         "triposr":    models["triposr"] is not None,
         "hunyuan":    models["hunyuan"] is not None,
         "trellis":    models["trellis"] is not None,
@@ -2414,10 +2224,10 @@ async def health():
         "trellis2_active": models.get("active_models", {}).get("trellis2", False),
         "active_models": [name for name in MODEL_KEYS if models.get("active_models", {}).get(name, False)],
         "rembg":      models["rembg_sess"] is not None,
-        "cuda":       torch.cuda.is_available(),
+        "cuda":       cuda_ok,
         "mps":        mps_ok,
         "runtime_device": models.get("runtime_device", "cpu"),
-        "gpu":        torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "gpu":        torch.cuda.get_device_name(0) if cuda_ok else None,
         "triposr_status": model_health["triposr"]["status"],
         "triposr_error": model_health["triposr"]["error"],
         "hunyuan_status": model_health["hunyuan"]["status"],
@@ -2426,9 +2236,6 @@ async def health():
         "trellis_error": model_health["trellis"]["error"],
         "trellis2_status": model_health["trellis2"]["status"],
         "trellis2_error": model_health["trellis2"]["error"],
-        "trellis2_endpoint_enabled": bool(_resolve_trellis2_endpoint_url()),
-        "trellis2_endpoint_host": _redacted_endpoint_for_log(_resolve_trellis2_endpoint_url()) if _resolve_trellis2_endpoint_url() else None,
-        "hf_token_present": bool(_resolve_hf_token()),
         "rembg_status": model_health["rembg"]["status"],
         "rembg_error": model_health["rembg"]["error"],
     }
@@ -2444,10 +2251,15 @@ async def convert(
     steps:      int  = 50,           # hunyuan/trellis diffusion steps
     post:       str  = "standard",   # none | light | standard | heavy
     preserve_proportions: str = "auto",
+    base:       str  = "none",       # none | flatten | plinth  (D&T flat base option)
 ):
+    dnt = get_dnt_settings()
     model = (model or "triposr").lower().strip()
     if model not in {"triposr", "hunyuan", "trellis", "trellis2"}:
         raise HTTPException(400, "Invalid model. Use: triposr, hunyuan, trellis, or trellis2")
+    if not dnt.dev_mode and model not in dnt.allowed_models:
+        raise HTTPException(403, f"The {model} model is not approved for use here. "
+                                 f"Approved: {', '.join(dnt.allowed_models)}")
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Images only")
@@ -2455,11 +2267,29 @@ async def convert(
     if post not in VALID_POST_LEVELS:
         raise HTTPException(400, "Invalid post level. Use: none, light, standard, heavy")
 
+    base = (base or "none").strip().lower()
+    if base not in BASE_MODES:
+        raise HTTPException(400, f"Invalid base. Use: {', '.join(BASE_MODES)}")
+
+    ext = Path(file.filename or "image.jpg").suffix.lower() or ".jpg"
+    if ext not in dnt.allowed_upload_ext:
+        raise HTTPException(400, f"Please upload a photo or drawing as {', '.join(dnt.allowed_upload_ext)}")
+
     job_id   = str(uuid.uuid4())
-    ext      = Path(file.filename or "image.jpg").suffix or ".jpg"
     img_path = UPLOAD_DIR / f"{job_id}{ext}"
+    max_bytes = int(dnt.max_upload_mb * 1024 * 1024)
+    written = 0
     with open(img_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                f.close()
+                _safe_unlink(img_path)
+                raise HTTPException(413, f"File is too big (limit {dnt.max_upload_mb:g} MB)")
+            f.write(chunk)
 
     preserve_raw = (preserve_proportions or "auto").strip().lower()
     if preserve_raw in {"", "auto"}:
@@ -2479,10 +2309,14 @@ async def convert(
         "steps":      normalized_steps,
         "post":       post,
         "preserve_proportions": preserve_flag,
+        "source_name": Path(file.filename or "").name,
     }
 
     # Determine which model to use
-    if model == "triposr":
+    if dnt.dev_mode:
+        run_fn = run_demo
+        model_label = "Sample (development mode)"
+    elif model == "triposr":
         if models["triposr"] is None:
             _safe_unlink(img_path)
             raise HTTPException(503, _model_unavailable_message("triposr", "TripoSR"))
@@ -2501,11 +2335,10 @@ async def convert(
         run_fn = run_trellis
         model_label = "TRELLIS"
     elif model == "trellis2":
-        endpoint_enabled = bool(_resolve_trellis2_endpoint_url())
-        if models["trellis2"] is None and not endpoint_enabled:
+        if models["trellis2"] is None:
             _safe_unlink(img_path)
             raise HTTPException(503, _model_unavailable_message("trellis2", "TRELLIS.2"))
-        run_fn = run_trellis2_endpoint_first if endpoint_enabled else run_trellis2
+        run_fn = run_trellis2
         model_label = "TRELLIS.2"
     else:
         run_fn = run_demo
@@ -2528,6 +2361,9 @@ async def convert(
         upload_path=str(img_path),
         output_dir=str(OUTPUT_DIR / job_id),
         upload_deleted=False,
+        base_mode=base,
+        print_report=None,
+        report_url=None,
     )
 
     out_dir = OUTPUT_DIR / job_id

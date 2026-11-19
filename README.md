@@ -1,3 +1,56 @@
+# D&T Sketch-to-3D
+
+An educational adaptation of [PIXFORM](https://github.com/dmonfrooij/pixform) for a
+Secondary 2 Design & Technology figurine project: students turn a sketch or photo into
+a small 3D-printable figurine (max **40 x 40 x 60 mm**). The AI runs **locally** on a
+school GPU machine; no student images are sent to outside AI services, and there are
+no paid APIs or credits. See [`NOTICE.md`](NOTICE.md) for attribution and
+[`MODEL_LICENCES.md`](MODEL_LICENCES.md) for model licences.
+
+**Status:** Phase 0 (housekeeping) and Phase 1 (command-line prototype) are done.
+The print preparation and development mode are tested without a GPU.
+**Real AI generation has not yet been tested in this adaptation.** Follow
+[`docs/PHASE1_GPU_TEST.md`](docs/PHASE1_GPU_TEST.md) on the GPU machine.
+
+### What is added on top of PIXFORM
+
+- Every model is scaled uniformly (proportions kept) to fit inside 40 x 40 x 60 mm.
+- Optional flat base: `flatten` (slice the bottom flat) or `plinth` (add a round base, counted inside the 60 mm).
+- Print checks with student-friendly messages: size, closed surface (watertight),
+  clean geometry (manifold), separate pieces, and an estimate of parts thinner than 1.2 mm.
+  The results are saved as `print_report.json` and returned by `/status/{job_id}` as `print_report`.
+- Separate parts are reported instead of silently deleted. Only tiny AI noise is removed.
+- Only approved models load (`DNT_ALLOWED_MODELS`, default `triposr`).
+- The remote TRELLIS.2 endpoint mode was removed.
+- Uploads are limited to JPG/PNG/WEBP up to 15 MB.
+
+### Try it without a GPU (development mode)
+
+```bash
+pip install -r backend/requirements-dnt.txt
+python scripts/make_samples.py            # only needed if sample-data/ is missing
+python scripts/sketch_to_stl.py sample-data/sketches/owl.png --out test_owl --dev --base plinth
+python -m pytest tests
+```
+
+Development mode skips the AI step and uses pre-made sample meshes
+(`sample-data/meshes/owl.stl` passes all checks; `robot.stl` deliberately has a loose
+part and a thin antenna). Everything after the AI step is the real code. To run the web
+server in development mode: `cd backend && DNT_DEV_MODE=1 python app.py`, then
+`POST /convert` with an image and optional `base=none|flatten|plinth`.
+(The new student interface is Phase 2; the original PIXFORM page is still served at `/`.)
+
+### Settings
+
+All classroom limits live in `backend/dnt/config.py` and can be set by environment variables:
+`DNT_MAX_X_MM`, `DNT_MAX_Y_MM`, `DNT_MAX_Z_MM`, `DNT_MIN_THICKNESS_MM` (default 1.2),
+`DNT_BASE_HEIGHT_MM`, `DNT_ALLOWED_MODELS`, `DNT_DEV_MODE`, `DNT_MAX_UPLOAD_MB`,
+`DNT_TRIPOSR_UP_AXIS`.
+
+---
+
+*The original PIXFORM documentation follows.*
+
 # PIXFORM - Image to 3D
 
 PIXFORM converts a single image into a local 3D model with focus on maximum output quality, usable exports, and easy local installation.
@@ -480,22 +533,11 @@ TRELLIS.2 uses `facebook/dinov3-vitl16-pretrain-lvd1689m` as its image encoder. 
 
 > The download is ~1 GB and happens only once. The script tells you exactly what to do if something goes wrong.
 
-### 8. TRELLIS.2 endpoint-first mode (remote first, local fallback)
+### 8. TRELLIS.2 endpoint-first mode (removed)
 
-If you prefer trying a remote endpoint before local TRELLIS.2 execution, set these environment variables:
-
-```powershell
-$env:PIXFORM_TRELLIS2_ENDPOINT_URL = "https://api-inference.huggingface.co/models/microsoft/TRELLIS.2-4B"
-$env:HF_TOKEN = "hf_your_token_here"
-$env:PIXFORM_TRELLIS2_ENDPOINT_TIMEOUT_SEC = "90"
-.\PIXFORM.bat
-```
-
-Behavior:
-
-- PIXFORM tries the endpoint first for `trellis2` jobs.
-- If endpoint call fails (timeout, auth, schema, or HTTP error), PIXFORM automatically falls back to local TRELLIS.2.
-- `/health` exposes `trellis2_endpoint_enabled` so UI/tools can see whether endpoint-first mode is active.
+The original PIXFORM could send images to a remote TRELLIS.2 endpoint before falling back
+to local generation. This was removed in D&T Sketch-to-3D so student images never
+leave the local machine. `PIXFORM_TRELLIS2_ENDPOINT_URL` is ignored.
 
 ---
 
